@@ -1,0 +1,669 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EE267 HW3 All-in-One: Foveated / DOF / Anaglyph / WebXR</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: white;
+      font-family: sans-serif;
+      overflow: hidden;
+    }
+
+    #ui {
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 16px;
+      border-radius: 12px;
+      line-height: 1.5;
+    }
+
+    button {
+      font-size: 16px;
+      padding: 10px 14px;
+      margin: 4px;
+      cursor: pointer;
+    }
+
+    #enter-vr {
+      font-size: 22px;
+      padding: 14px 22px;
+      background: white;
+      color: black;
+      border: none;
+      border-radius: 8px;
+    }
+
+    canvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <h2>EE267 HW3 All-in-One</h2>
+    <div>Mode: <span id="mode-name">Normal</span></div>
+    <button onclick="setMode(0)">Normal</button>
+    <button onclick="setMode(1)">Foveated</button>
+    <button onclick="setMode(2)">Depth of Field</button>
+    <button onclick="setMode(3)">Anaglyph</button>
+    <br>
+    <button id="enter-vr">Enter VR</button>
+    <p>
+      Desktop: buttons로 모드 변경<br>
+      Quest: Enter VR 후 WebXR stereo 렌더링
+    </p>
+  </div>
+
+  <canvas id="glcanvas"></canvas>
+
+<script>
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2", { xrCompatible: true });
+
+if (!gl) {
+  alert("WebGL2 not supported");
+}
+
+let mode = 0;
+// 0 normal, 1 foveated, 2 dof, 3 anaglyph
+
+const modeNames = ["Normal", "Foveated", "Depth of Field", "Anaglyph"];
+
+function setMode(m) {
+  mode = m;
+  document.getElementById("mode-name").textContent = modeNames[mode];
+}
+
+const params = new URLSearchParams(location.search);
+if (params.get("mode") === "foveated") setMode(1);
+if (params.get("mode") === "dof") setMode(2);
+if (params.get("mode") === "anaglyph") setMode(3);
+
+// ---------------- Matrix helpers ----------------
+
+function mat4Identity() {
+  return new Float32Array([
+    1,0,0,0,
+    0,1,0,0,
+    0,0,1,0,
+    0,0,0,1
+  ]);
+}
+
+function mat4Multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      out[c * 4 + r] =
+        a[0 * 4 + r] * b[c * 4 + 0] +
+        a[1 * 4 + r] * b[c * 4 + 1] +
+        a[2 * 4 + r] * b[c * 4 + 2] +
+        a[3 * 4 + r] * b[c * 4 + 3];
+    }
+  }
+  return out;
+}
+
+function mat4Perspective(fovy, aspect, near, far) {
+  const f = 1.0 / Math.tan(fovy / 2);
+  const nf = 1 / (near - far);
+
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, (2 * far * near) * nf, 0
+  ]);
+}
+
+function mat4Translation(x, y, z) {
+  const m = mat4Identity();
+  m[12] = x;
+  m[13] = y;
+  m[14] = z;
+  return m;
+}
+
+function mat4RotationX(a) {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, c, s, 0,
+    0, -s, c, 0,
+    0, 0, 0, 1
+  ]);
+}
+
+function mat4RotationY(a) {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+
+  return new Float32Array([
+    c, 0, -s, 0,
+    0, 1, 0, 0,
+    s, 0, c, 0,
+    0, 0, 0, 1
+  ]);
+}
+
+function mat4Scale(s) {
+  return new Float32Array([
+    s,0,0,0,
+    0,s,0,0,
+    0,0,s,0,
+    0,0,0,1
+  ]);
+}
+
+// ---------------- Shader helpers ----------------
+
+function createShader(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(shader));
+    throw new Error("Shader compile error");
+  }
+
+  return shader;
+}
+
+function createProgram(vs, fs) {
+  const program = gl.createProgram();
+  gl.attachShader(program, createShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(program, createShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(program);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program));
+    throw new Error("Program link error");
+  }
+
+  return program;
+}
+
+// ---------------- Scene shaders ----------------
+
+const sceneVS = `#version 300 es
+precision highp float;
+
+in vec3 a_position;
+in vec3 a_color;
+
+uniform mat4 u_projection;
+uniform mat4 u_view;
+uniform mat4 u_model;
+
+out vec3 v_color;
+out float v_depth;
+
+void main() {
+  vec4 worldPos = u_model * vec4(a_position, 1.0);
+  vec4 viewPos = u_view * worldPos;
+
+  v_color = a_color;
+
+  // 카메라 앞쪽 거리. Depth-of-field blur용으로 alpha에 저장할 값.
+  float z = -viewPos.z;
+  v_depth = clamp((z - 0.5) / 5.0, 0.0, 1.0);
+
+  gl_Position = u_projection * viewPos;
+}
+`;
+
+const sceneFS = `#version 300 es
+precision highp float;
+
+in vec3 v_color;
+in float v_depth;
+
+out vec4 outColor;
+
+void main() {
+  outColor = vec4(v_color, v_depth);
+}
+`;
+
+const sceneProgram = createProgram(sceneVS, sceneFS);
+
+const sceneLoc = {
+  aPosition: gl.getAttribLocation(sceneProgram, "a_position"),
+  aColor: gl.getAttribLocation(sceneProgram, "a_color"),
+  uProjection: gl.getUniformLocation(sceneProgram, "u_projection"),
+  uView: gl.getUniformLocation(sceneProgram, "u_view"),
+  uModel: gl.getUniformLocation(sceneProgram, "u_model")
+};
+
+// ---------------- Post-process shaders ----------------
+
+const quadVS = `#version 300 es
+precision highp float;
+
+in vec2 a_position;
+out vec2 v_uv;
+
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}
+`;
+
+const postFS = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_colorTex;
+uniform sampler2D u_rightTex;
+uniform int u_mode;
+uniform float u_focusDepth;
+
+out vec4 outColor;
+
+vec4 blur9(sampler2D tex, vec2 uv, float radius) {
+  vec4 c = vec4(0.0);
+
+  c += texture(tex, uv + vec2(-radius, -radius));
+  c += texture(tex, uv + vec2( 0.0,    -radius));
+  c += texture(tex, uv + vec2( radius, -radius));
+
+  c += texture(tex, uv + vec2(-radius, 0.0));
+  c += texture(tex, uv);
+  c += texture(tex, uv + vec2( radius, 0.0));
+
+  c += texture(tex, uv + vec2(-radius,  radius));
+  c += texture(tex, uv + vec2( 0.0,     radius));
+  c += texture(tex, uv + vec2( radius,  radius));
+
+  return c / 9.0;
+}
+
+void main() {
+  vec4 base = texture(u_colorTex, v_uv);
+
+  // 0. Normal
+  if (u_mode == 0) {
+    outColor = vec4(base.rgb, 1.0);
+    return;
+  }
+
+  // 1. Foveated rendering
+  // 화면 중앙은 선명하게, 주변부로 갈수록 blur.
+  if (u_mode == 1) {
+    float distFromCenter = distance(v_uv, vec2(0.5, 0.5));
+    float blurAmount = smoothstep(0.15, 0.65, distFromCenter);
+    float radius = blurAmount * 0.012;
+
+    vec4 blurred = blur9(u_colorTex, v_uv, radius);
+    outColor = vec4(mix(base.rgb, blurred.rgb, blurAmount), 1.0);
+    return;
+  }
+
+  // 2. Depth of field
+  // 특정 depth 근처만 선명하고 앞/뒤는 blur.
+  if (u_mode == 2) {
+    float depth = base.a;
+    float blurAmount = smoothstep(0.03, 0.30, abs(depth - u_focusDepth));
+    float radius = blurAmount * 0.014;
+
+    vec4 blurred = blur9(u_colorTex, v_uv, radius);
+    outColor = vec4(mix(base.rgb, blurred.rgb, blurAmount), 1.0);
+    return;
+  }
+
+  // 3. Anaglyph stereo
+  // 왼쪽 view의 red + 오른쪽 view의 green/blue 합성.
+  if (u_mode == 3) {
+    vec4 leftColor = texture(u_colorTex, v_uv);
+    vec4 rightColor = texture(u_rightTex, v_uv);
+
+    vec3 anaglyph = vec3(
+      leftColor.r,
+      rightColor.g,
+      rightColor.b
+    );
+
+    outColor = vec4(anaglyph, 1.0);
+    return;
+  }
+
+  outColor = vec4(base.rgb, 1.0);
+}
+`;
+
+const postProgram = createProgram(quadVS, postFS);
+
+const postLoc = {
+  aPosition: gl.getAttribLocation(postProgram, "a_position"),
+  uColorTex: gl.getUniformLocation(postProgram, "u_colorTex"),
+  uRightTex: gl.getUniformLocation(postProgram, "u_rightTex"),
+  uMode: gl.getUniformLocation(postProgram, "u_mode"),
+  uFocusDepth: gl.getUniformLocation(postProgram, "u_focusDepth")
+};
+
+// ---------------- Cube geometry ----------------
+
+const s = 0.5;
+
+const cubeVertices = new Float32Array([
+  // front red
+  -s,-s, s, 1,0.1,0.1,   s,-s, s, 1,0.1,0.1,   s, s, s, 1,0.1,0.1,
+  -s,-s, s, 1,0.1,0.1,   s, s, s, 1,0.1,0.1,  -s, s, s, 1,0.1,0.1,
+
+  // back green
+   s,-s,-s, 0.1,1,0.1,  -s,-s,-s, 0.1,1,0.1,  -s, s,-s, 0.1,1,0.1,
+   s,-s,-s, 0.1,1,0.1,  -s, s,-s, 0.1,1,0.1,   s, s,-s, 0.1,1,0.1,
+
+  // left blue
+  -s,-s,-s, 0.1,0.3,1,  -s,-s, s, 0.1,0.3,1,  -s, s, s, 0.1,0.3,1,
+  -s,-s,-s, 0.1,0.3,1,  -s, s, s, 0.1,0.3,1,  -s, s,-s, 0.1,0.3,1,
+
+  // right yellow
+   s,-s, s, 1,1,0.1,    s,-s,-s, 1,1,0.1,    s, s,-s, 1,1,0.1,
+   s,-s, s, 1,1,0.1,    s, s,-s, 1,1,0.1,    s, s, s, 1,1,0.1,
+
+  // top magenta
+  -s, s, s, 1,0.1,1,    s, s, s, 1,0.1,1,    s, s,-s, 1,0.1,1,
+  -s, s, s, 1,0.1,1,    s, s,-s, 1,0.1,1,   -s, s,-s, 1,0.1,1,
+
+  // bottom cyan
+  -s,-s,-s, 0.1,1,1,    s,-s,-s, 0.1,1,1,    s,-s, s, 0.1,1,1,
+  -s,-s,-s, 0.1,1,1,    s,-s, s, 0.1,1,1,   -s,-s, s, 0.1,1,1
+]);
+
+const cubeVAO = gl.createVertexArray();
+gl.bindVertexArray(cubeVAO);
+
+const cubeVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cubeVBO);
+gl.bufferData(gl.ARRAY_BUFFER, cubeVertices, gl.STATIC_DRAW);
+
+gl.enableVertexAttribArray(sceneLoc.aPosition);
+gl.vertexAttribPointer(sceneLoc.aPosition, 3, gl.FLOAT, false, 24, 0);
+
+gl.enableVertexAttribArray(sceneLoc.aColor);
+gl.vertexAttribPointer(sceneLoc.aColor, 3, gl.FLOAT, false, 24, 12);
+
+gl.bindVertexArray(null);
+
+// ---------------- Fullscreen quad ----------------
+
+const quadVertices = new Float32Array([
+  -1,-1,
+   1,-1,
+   1, 1,
+
+  -1,-1,
+   1, 1,
+  -1, 1
+]);
+
+const quadVAO = gl.createVertexArray();
+gl.bindVertexArray(quadVAO);
+
+const quadVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+
+gl.enableVertexAttribArray(postLoc.aPosition);
+gl.vertexAttribPointer(postLoc.aPosition, 2, gl.FLOAT, false, 8, 0);
+
+gl.bindVertexArray(null);
+
+// ---------------- Render targets ----------------
+
+function createRenderTarget(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA8,
+    w,
+    h,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    null
+  );
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  const depth = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,
+    gl.TEXTURE_2D,
+    tex,
+    0
+  );
+  gl.framebufferRenderbuffer(
+    gl.FRAMEBUFFER,
+    gl.DEPTH_ATTACHMENT,
+    gl.RENDERBUFFER,
+    depth
+  );
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  return { tex, depth, fb, w, h };
+}
+
+let rtLeft = null;
+let rtRight = null;
+
+function resizeRenderTargets(w, h) {
+  rtLeft = createRenderTarget(w, h);
+  rtRight = createRenderTarget(w, h);
+}
+
+// ---------------- Scene render ----------------
+
+function renderSceneToTarget(target, projection, view, time, eyeShift) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target.fb);
+  gl.viewport(0, 0, target.w, target.h);
+
+  gl.clearColor(0.02, 0.02, 0.03, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+
+  gl.useProgram(sceneProgram);
+  gl.bindVertexArray(cubeVAO);
+
+  gl.uniformMatrix4fv(sceneLoc.uProjection, false, projection);
+  gl.uniformMatrix4fv(sceneLoc.uView, false, view);
+
+  const t = time * 0.001;
+
+  const objects = [
+    { x: -1.0 + eyeShift, y: 0.0, z: -1.6, scale: 0.45, rot: t * 1.3 },
+    { x:  0.0 + eyeShift, y: 0.0, z: -2.6, scale: 0.55, rot: t * 0.8 },
+    { x:  1.0 + eyeShift, y: 0.0, z: -3.8, scale: 0.65, rot: t * 0.5 }
+  ];
+
+  for (const obj of objects) {
+    const T = mat4Translation(obj.x, obj.y, obj.z);
+    const R = mat4Multiply(mat4RotationY(obj.rot), mat4RotationX(obj.rot * 0.7));
+    const S = mat4Scale(obj.scale);
+    const M = mat4Multiply(T, mat4Multiply(R, S));
+
+    gl.uniformMatrix4fv(sceneLoc.uModel, false, M);
+    gl.drawArrays(gl.TRIANGLES, 0, 36);
+  }
+
+  gl.bindVertexArray(null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function postProcessToScreen(source, rightSource, targetFramebuffer, x, y, w, h, currentMode) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, targetFramebuffer);
+  gl.viewport(x, y, w, h);
+  gl.disable(gl.DEPTH_TEST);
+
+  gl.useProgram(postProgram);
+  gl.bindVertexArray(quadVAO);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, source.tex);
+  gl.uniform1i(postLoc.uColorTex, 0);
+
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, rightSource ? rightSource.tex : source.tex);
+  gl.uniform1i(postLoc.uRightTex, 1);
+
+  gl.uniform1i(postLoc.uMode, currentMode);
+  gl.uniform1f(postLoc.uFocusDepth, 0.42);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.bindVertexArray(null);
+}
+
+// ---------------- Desktop rendering ----------------
+
+function resizeCanvas() {
+  canvas.width = Math.floor(window.innerWidth * devicePixelRatio);
+  canvas.height = Math.floor(window.innerHeight * devicePixelRatio);
+  resizeRenderTargets(canvas.width, canvas.height);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+function renderDesktop(time) {
+  if (xrSession) return;
+
+  const aspect = canvas.width / canvas.height;
+  const projection = mat4Perspective(Math.PI / 4, aspect, 0.1, 100.0);
+
+  const eyeSep = 0.08;
+
+  const leftView = mat4Translation(eyeSep * 0.5, 0, 0);
+  const rightView = mat4Translation(-eyeSep * 0.5, 0, 0);
+  const monoView = mat4Identity();
+
+  if (mode === 3) {
+    renderSceneToTarget(rtLeft, projection, leftView, time, 0.0);
+    renderSceneToTarget(rtRight, projection, rightView, time, 0.0);
+    postProcessToScreen(rtLeft, rtRight, null, 0, 0, canvas.width, canvas.height, 3);
+  } else {
+    renderSceneToTarget(rtLeft, projection, monoView, time, 0.0);
+    postProcessToScreen(rtLeft, rtLeft, null, 0, 0, canvas.width, canvas.height, mode);
+  }
+
+  requestAnimationFrame(renderDesktop);
+}
+
+requestAnimationFrame(renderDesktop);
+
+// ---------------- WebXR rendering ----------------
+
+let xrSession = null;
+let xrRefSpace = null;
+let xrBaseLayer = null;
+
+async function startXR() {
+  if (!navigator.xr) {
+    alert("WebXR not supported");
+    return;
+  }
+
+  const ok = await navigator.xr.isSessionSupported("immersive-vr");
+  if (!ok) {
+    alert("immersive-vr not supported");
+    return;
+  }
+
+  await gl.makeXRCompatible();
+
+  xrSession = await navigator.xr.requestSession("immersive-vr");
+  xrBaseLayer = new XRWebGLLayer(xrSession, gl);
+
+  xrSession.updateRenderState({
+    baseLayer: xrBaseLayer
+  });
+
+  xrRefSpace = await xrSession.requestReferenceSpace("local");
+
+  document.getElementById("ui").style.display = "none";
+
+  // XR용 offscreen target. 너무 크면 느릴 수 있어서 적당히.
+  resizeRenderTargets(1024, 1024);
+
+  xrSession.requestAnimationFrame(renderXR);
+
+  xrSession.addEventListener("end", () => {
+    xrSession = null;
+    document.getElementById("ui").style.display = "block";
+    resizeCanvas();
+    requestAnimationFrame(renderDesktop);
+  });
+}
+
+function renderXR(time, frame) {
+  const session = frame.session;
+  const pose = frame.getViewerPose(xrRefSpace);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, xrBaseLayer.framebuffer);
+  gl.enable(gl.SCISSOR_TEST);
+
+  if (pose) {
+    for (const view of pose.views) {
+      const viewport = xrBaseLayer.getViewport(view);
+
+      // WebXR에서는 Quest가 left/right eye의 projection/view를 줌.
+      const projection = view.projectionMatrix;
+      const viewMatrix = view.transform.inverse.matrix;
+
+      renderSceneToTarget(rtLeft, projection, viewMatrix, time, 0.0);
+
+      // Anaglyph는 모니터/안경용이라 VR 안에서는 일반 stereo로 처리.
+      const xrMode = mode === 3 ? 0 : mode;
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, xrBaseLayer.framebuffer);
+      gl.scissor(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height
+      );
+
+      postProcessToScreen(
+        rtLeft,
+        rtLeft,
+        xrBaseLayer.framebuffer,
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height,
+        xrMode
+      );
+    }
+  }
+
+  session.requestAnimationFrame(renderXR);
+}
+
+document.getElementById("enter-vr").addEventListener("click", startXR);
+</script>
+</body>
+</html>
