@@ -1,0 +1,275 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>HW3 WebXR Stereo</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: white;
+      font-family: sans-serif;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #enter-vr {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 36px;
+      padding: 28px 48px;
+      z-index: 10;
+    }
+
+    #info {
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      font-size: 18px;
+      line-height: 1.5;
+    }
+
+    canvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: black;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="info">
+    <h2>HW3: WebXR Stereo Rendering</h2>
+    <p>Quest Pro에서 left eye / right eye에 따로 렌더링</p>
+  </div>
+
+  <button id="enter-vr">Enter VR</button>
+  <canvas id="glcanvas"></canvas>
+
+<script>
+const canvas = document.getElementById("glcanvas");
+const button = document.getElementById("enter-vr");
+const gl = canvas.getContext("webgl2", { xrCompatible: true });
+
+if (!gl) {
+  alert("WebGL2 not supported");
+}
+
+let xrSession = null;
+let xrRefSpace = null;
+let xrBaseLayer = null;
+
+const vs = `#version 300 es
+precision highp float;
+
+in vec3 a_position;
+in vec3 a_color;
+
+uniform mat4 u_projection;
+uniform mat4 u_view;
+uniform mat4 u_model;
+
+out vec3 v_color;
+
+void main() {
+  v_color = a_color;
+  gl_Position = u_projection * u_view * u_model * vec4(a_position, 1.0);
+}
+`;
+
+const fs = `#version 300 es
+precision highp float;
+
+in vec3 v_color;
+uniform vec3 u_eyeTint;
+
+out vec4 outColor;
+
+void main() {
+  outColor = vec4(v_color * u_eyeTint, 1.0);
+}
+`;
+
+function shader(type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+function program(vsSource, fsSource) {
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vsSource));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fsSource));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+const prog = program(vs, fs);
+const aPos = gl.getAttribLocation(prog, "a_position");
+const aCol = gl.getAttribLocation(prog, "a_color");
+const uProjection = gl.getUniformLocation(prog, "u_projection");
+const uView = gl.getUniformLocation(prog, "u_view");
+const uModel = gl.getUniformLocation(prog, "u_model");
+const uEyeTint = gl.getUniformLocation(prog, "u_eyeTint");
+
+const s = 0.35;
+const cube = new Float32Array([
+  -s,-s, s, 1,0,0,  s,-s, s, 1,0,0,  s, s, s, 1,0,0,
+  -s,-s, s, 1,0,0,  s, s, s, 1,0,0, -s, s, s, 1,0,0,
+
+   s,-s,-s, 0,1,0, -s,-s,-s, 0,1,0, -s, s,-s, 0,1,0,
+   s,-s,-s, 0,1,0, -s, s,-s, 0,1,0,  s, s,-s, 0,1,0,
+
+  -s,-s,-s, 0,0,1, -s,-s, s, 0,0,1, -s, s, s, 0,0,1,
+  -s,-s,-s, 0,0,1, -s, s, s, 0,0,1, -s, s,-s, 0,0,1,
+
+   s,-s, s, 1,1,0,  s,-s,-s, 1,1,0,  s, s,-s, 1,1,0,
+   s,-s, s, 1,1,0,  s, s,-s, 1,1,0,  s, s, s, 1,1,0,
+
+  -s, s, s, 1,0,1,  s, s, s, 1,0,1,  s, s,-s, 1,0,1,
+  -s, s, s, 1,0,1,  s, s,-s, 1,0,1, -s, s,-s, 1,0,1,
+
+  -s,-s,-s, 0,1,1,  s,-s,-s, 0,1,1,  s,-s, s, 0,1,1,
+  -s,-s,-s, 0,1,1,  s,-s, s, 0,1,1, -s,-s, s, 0,1,1
+]);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const buffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+gl.bufferData(gl.ARRAY_BUFFER, cube, gl.STATIC_DRAW);
+
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 24, 0);
+
+gl.enableVertexAttribArray(aCol);
+gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 24, 12);
+
+function identity() {
+  return new Float32Array([
+    1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+  ]);
+}
+
+function multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      out[c*4+r] =
+        a[0*4+r]*b[c*4+0] +
+        a[1*4+r]*b[c*4+1] +
+        a[2*4+r]*b[c*4+2] +
+        a[3*4+r]*b[c*4+3];
+    }
+  }
+  return out;
+}
+
+function translate(x, y, z) {
+  const m = identity();
+  m[12] = x; m[13] = y; m[14] = z;
+  return m;
+}
+
+function rotateX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+    1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1
+  ]);
+}
+
+function rotateY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+    c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1
+  ]);
+}
+
+function modelMatrix(time) {
+  const t = time * 0.001;
+  const T = translate(0.0, 0.0, -2.0);
+  const R = multiply(rotateY(t), rotateX(t * 0.6));
+  return multiply(T, R);
+}
+
+async function startXR() {
+  if (!navigator.xr) {
+    alert("WebXR not supported");
+    return;
+  }
+
+  const ok = await navigator.xr.isSessionSupported("immersive-vr");
+  if (!ok) {
+    alert("immersive-vr not supported");
+    return;
+  }
+
+  await gl.makeXRCompatible();
+
+  xrSession = await navigator.xr.requestSession("immersive-vr");
+  xrBaseLayer = new XRWebGLLayer(xrSession, gl);
+
+  xrSession.updateRenderState({ baseLayer: xrBaseLayer });
+  xrRefSpace = await xrSession.requestReferenceSpace("local");
+
+  button.style.display = "none";
+  document.getElementById("info").style.display = "none";
+
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+function onXRFrame(time, frame) {
+  const pose = frame.getViewerPose(xrRefSpace);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, xrBaseLayer.framebuffer);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.SCISSOR_TEST);
+
+  if (pose) {
+    const model = modelMatrix(time);
+
+    for (const view of pose.views) {
+      const viewport = xrBaseLayer.getViewport(view);
+
+      gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+      gl.scissor(viewport.x, viewport.y, viewport.width, viewport.height);
+
+      gl.clearColor(0.02, 0.02, 0.03, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      gl.useProgram(prog);
+      gl.bindVertexArray(vao);
+
+      gl.uniformMatrix4fv(uProjection, false, view.projectionMatrix);
+      gl.uniformMatrix4fv(uView, false, view.transform.inverse.matrix);
+      gl.uniformMatrix4fv(uModel, false, model);
+
+      if (view.eye === "left") {
+        gl.uniform3f(uEyeTint, 1.0, 0.65, 0.65);
+      } else if (view.eye === "right") {
+        gl.uniform3f(uEyeTint, 0.65, 0.65, 1.0);
+      } else {
+        gl.uniform3f(uEyeTint, 1.0, 1.0, 1.0);
+      }
+
+      gl.drawArrays(gl.TRIANGLES, 0, 36);
+    }
+  }
+
+  frame.session.requestAnimationFrame(onXRFrame);
+}
+
+button.addEventListener("click", startXR);
+</script>
+</body>
