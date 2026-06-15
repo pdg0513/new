@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Quest WebXR WebGL Stereo Test</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: white;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    button {
+      font-size: 24px;
+      padding: 16px 28px;
+    }
+    canvas {
+      width: 80vw;
+      height: 45vw;
+      max-height: 60vh;
+      background: black;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Quest WebXR + WebGL Stereo Test</h1>
+  <button id="enter-vr">Enter VR</button>
+  <canvas id="glcanvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById("glcanvas");
+    const button = document.getElementById("enter-vr");
+
+    const gl = canvas.getContext("webgl2", { xrCompatible: true });
+
+    if (!gl) {
+      alert("WebGL2 not supported");
+    }
+
+    let xrSession = null;
+    let xrRefSpace = null;
+    let xrBaseLayer = null;
+
+    async function startXR() {
+      if (!navigator.xr) {
+        alert("WebXR not supported in this browser");
+        return;
+      }
+
+      const supported = await navigator.xr.isSessionSupported("immersive-vr");
+      if (!supported) {
+        alert("immersive-vr not supported");
+        return;
+      }
+
+      xrSession = await navigator.xr.requestSession("immersive-vr");
+
+      await gl.makeXRCompatible();
+
+      xrBaseLayer = new XRWebGLLayer(xrSession, gl);
+
+      xrSession.updateRenderState({
+        baseLayer: xrBaseLayer
+      });
+
+      xrRefSpace = await xrSession.requestReferenceSpace("local");
+
+      xrSession.requestAnimationFrame(onXRFrame);
+    }
+
+    function onXRFrame(time, frame) {
+      const session = frame.session;
+      const pose = frame.getViewerPose(xrRefSpace);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, xrBaseLayer.framebuffer);
+      gl.enable(gl.SCISSOR_TEST);
+
+      if (pose) {
+        for (const view of pose.views) {
+          const viewport = xrBaseLayer.getViewport(view);
+
+          gl.viewport(
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height
+          );
+
+          gl.scissor(
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height
+          );
+
+          if (view.eye === "left") {
+            // Left eye: red
+            gl.clearColor(1.0, 0.0, 0.0, 1.0);
+          } else if (view.eye === "right") {
+            // Right eye: blue
+            gl.clearColor(0.0, 0.0, 1.0, 1.0);
+          } else {
+            gl.clearColor(0.0, 1.0, 0.0, 1.0);
+          }
+
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        }
+      }
+
+      session.requestAnimationFrame(onXRFrame);
+    }
+
+    button.addEventListener("click", startXR);
+  </script>
+</body>
+</html>
