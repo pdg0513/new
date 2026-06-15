@@ -1,0 +1,192 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>HW1 Transform</title>
+  <style>
+    body { margin: 0; background: #111; color: white; font-family: sans-serif; overflow: hidden; }
+    #info { position: fixed; left: 20px; top: 20px; z-index: 2; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <h2>HW1: WebGL Transform</h2>
+    <p>Model × View × Projection matrix로 회전하는 큐브</p>
+  </div>
+  <canvas id="glcanvas"></canvas>
+
+<script>
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2");
+
+function resize() {
+  canvas.width = innerWidth * devicePixelRatio;
+  canvas.height = innerHeight * devicePixelRatio;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener("resize", resize);
+resize();
+
+const vs = `#version 300 es
+precision highp float;
+
+in vec3 a_position;
+in vec3 a_color;
+
+uniform mat4 u_mvp;
+
+out vec3 v_color;
+
+void main() {
+  v_color = a_color;
+  gl_Position = u_mvp * vec4(a_position, 1.0);
+}
+`;
+
+const fs = `#version 300 es
+precision highp float;
+
+in vec3 v_color;
+out vec4 outColor;
+
+void main() {
+  outColor = vec4(v_color, 1.0);
+}
+`;
+
+function shader(type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+function program(vsSource, fsSource) {
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, vsSource));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fsSource));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+const prog = program(vs, fs);
+const aPos = gl.getAttribLocation(prog, "a_position");
+const aCol = gl.getAttribLocation(prog, "a_color");
+const uMvp = gl.getUniformLocation(prog, "u_mvp");
+
+const cube = new Float32Array([
+  // position          color
+  -1,-1, 1,  1,0,0,   1,-1, 1,  1,0,0,   1, 1, 1,  1,0,0,
+  -1,-1, 1,  1,0,0,   1, 1, 1,  1,0,0,  -1, 1, 1,  1,0,0,
+
+   1,-1,-1,  0,1,0,  -1,-1,-1,  0,1,0,  -1, 1,-1,  0,1,0,
+   1,-1,-1,  0,1,0,  -1, 1,-1,  0,1,0,   1, 1,-1,  0,1,0,
+
+  -1,-1,-1,  0,0,1,  -1,-1, 1,  0,0,1,  -1, 1, 1,  0,0,1,
+  -1,-1,-1,  0,0,1,  -1, 1, 1,  0,0,1,  -1, 1,-1,  0,0,1,
+
+   1,-1, 1,  1,1,0,   1,-1,-1,  1,1,0,   1, 1,-1,  1,1,0,
+   1,-1, 1,  1,1,0,   1, 1,-1,  1,1,0,   1, 1, 1,  1,1,0,
+
+  -1, 1, 1,  1,0,1,   1, 1, 1,  1,0,1,   1, 1,-1,  1,0,1,
+  -1, 1, 1,  1,0,1,   1, 1,-1,  1,0,1,  -1, 1,-1,  1,0,1,
+
+  -1,-1,-1,  0,1,1,   1,-1,-1,  0,1,1,   1,-1, 1,  0,1,1,
+  -1,-1,-1,  0,1,1,   1,-1, 1,  0,1,1,  -1,-1, 1,  0,1,1
+]);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const buffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+gl.bufferData(gl.ARRAY_BUFFER, cube, gl.STATIC_DRAW);
+
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 24, 0);
+
+gl.enableVertexAttribArray(aCol);
+gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 24, 12);
+
+function identity() {
+  return new Float32Array([
+    1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+  ]);
+}
+
+function multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      out[c*4+r] =
+        a[0*4+r]*b[c*4+0] +
+        a[1*4+r]*b[c*4+1] +
+        a[2*4+r]*b[c*4+2] +
+        a[3*4+r]*b[c*4+3];
+    }
+  }
+  return out;
+}
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f/aspect,0,0,0,
+    0,f,0,0,
+    0,0,(far+near)*nf,-1,
+    0,0,(2*far*near)*nf,0
+  ]);
+}
+
+function translate(x, y, z) {
+  const m = identity();
+  m[12] = x; m[13] = y; m[14] = z;
+  return m;
+}
+
+function rotateX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+    1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1
+  ]);
+}
+
+function rotateY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+    c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1
+  ]);
+}
+
+function render(time) {
+  time *= 0.001;
+
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 100);
+  const view = translate(0, 0, -6);
+  const model = multiply(rotateY(time), rotateX(time * 0.7));
+  const mvp = multiply(proj, multiply(view, model));
+
+  gl.clearColor(0.02, 0.02, 0.03, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+  gl.drawArrays(gl.TRIANGLES, 0, 36);
+
+  requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
